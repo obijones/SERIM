@@ -118,7 +118,6 @@ pytest
 ## Notes
 
 * The live monitor never imports `matplotlib`. It is used only by `report.py`, so you can remove it if you do not need reports.
-* Nothing is committed that holds secrets or captured data. Copy `env.example` to `.env` for your own settings, and keep `.env`, the evidence folder, and the database out of version control (see `.gitignore`).
 
 ## License
 
