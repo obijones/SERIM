@@ -1,4 +1,4 @@
-# Serim
+# SERIM (Search Engine Results Integrity Monitor)
 
 Serim watches Google and Bing search results and flags ads and pages that pretend to be your brand. It is built for brand protection and phishing teams who want early warning when someone bids on your name or poisons search results to steal logins.
 
