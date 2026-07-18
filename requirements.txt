@@ -1,0 +1,29 @@
+# Brand Protection Sponsored Ad Monitor
+# requirements.txt
+#
+# Install into your existing venv:
+#   pip install -r requirements.txt
+#   playwright install chromium
+#
+# System dependency (outside venv — one time only):
+#   sudo apt install xvfb
+ 
+# Browser automation
+playwright>=1.44.0
+playwright-stealth>=2.0.3
+ 
+# Virtual display (Python wrapper around system xvfb — replaces xvfb-run)
+PyVirtualDisplay>=3.0
+ 
+# In-process scheduling (used with --schedule flag)
+schedule>=1.2.2
+ 
+# Environment variable management
+python-dotenv>=1.0.1
+
+# Test runner (offline unit tests for pure logic — tests/)
+pytest>=8.0.0
+
+# Charting for the manager metrics report (report.py only — the live monitor
+# never imports it). Pulls numpy/pillow/etc. Remove if reporting is not used.
+matplotlib>=3.7.0

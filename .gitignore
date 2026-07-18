@@ -1,0 +1,62 @@
+# Secrets and environment. Never commit these.
+# The .env file holds SMTP credentials and the Mailgun API key.
+# env.example is safe to commit and is not matched by these rules.
+.env
+.env.*
+*.pem
+*.key
+
+# Saved browser profile. Holds Google session cookies and consent state,
+# which are effectively login credentials.
+browser_profile/
+
+# Captured evidence and case data. May contain flagged URLs, screenshots,
+# tracking ids, and advertiser details.
+evidence/
+reports/
+triaged_domains.json
+*_flagged.json
+
+# Databases and logs written at runtime.
+*.db
+*.db.bak*
+*.sqlite
+*.sqlite3
+*.log
+
+# Python bytecode and build output.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments.
+venv/
+.venv/
+env/
+ENV/
+pyvenv.cfg
+
+# Test and type checker caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local editor and assistant config.
+.claude/settings.local.json
+.idea/
+.vscode/
+*.swp
+*~
+
+# Operating system junk.
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backups.
+*.bak
+*.orig
