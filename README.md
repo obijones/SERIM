@@ -140,12 +140,23 @@ The rule itself lives in `fi_registry.py` and is imported by both the monitor an
 
 ## Reports
 
-`report.py` builds a metrics report from the database:
+`report.py` builds an executive pack from the database — slide-ready PNG charts, a single self-contained `report.html`, and CSV aggregates:
 
 ```
-python report.py --format html
-python report.py --summary
+python report.py                 # full pack to ./reports/ (monthly trend)
+python report.py --period week   # finer detail for operational review
+python report.py --summary       # census + KPIs to stdout, no files
 ```
+
+The charts, all scoped to confirmed threats by default:
+
+* **Impersonation over time** — campaigns live per period. Monthly by default (`--period month`), which reads a 13–14 month history cleanly; partial edge months are marked, never dropped, so a short month cannot read as a decline.
+* **Paid ads vs SEO poisoning** — the same trend split by how each campaign reached customers, because the two need different takedowns.
+* **Engine and device** — a donut, two blues for Bing and two oranges for Google; cases with no device recorded are counted in the caption rather than dropped.
+* **Longest-lived threats** — the campaigns that stayed live longest, coloured by attack type (paid / SEO / both). The span is exposure observed while monitoring — a minimum, not a time-to-takedown, since Serim tracks detection, not remediation.
+* **Search-term and top-domain breakdowns.**
+
+The report does **not** draw the triage funnel. Executives use a Microsoft funnel graphic (PowerPoint SmartArt, Excel or Power BI), so `report.py` emits the funnel stage figures — all findings → legitimate institutions set aside → real campaigns, with the unreviewed queue alongside — as `funnel.csv` to paste straight in.
 
 Charts and KPIs cover **threats only** by default, since a chart captioned "fraudulent ads" that counted legitimate competitors would be lying. The three-state census is printed whatever the scope, so nothing is dropped silently:
 

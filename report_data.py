@@ -244,6 +244,46 @@ def trend(cases: list[dict], period: str = "week") -> list[dict]:
     return rows
 
 
+def channel_trend(cases: list[dict], period: str = "month") -> list[dict]:
+    """
+    Per-period active-campaign counts split by channel: paid ads vs SEO poisoning.
+
+    Mirrors trend()'s bucketing (a campaign is active in every bucket its
+    first→last window overlaps) so the two charts line up. A campaign reached
+    BOTH ways counts in each series, so paid + seo need not equal the total —
+    same non-exclusivity as kpis()' sponsored/organic split.
+
+    Returns rows {bucket, start, end, paid, seo, onset, partial}, chronological.
+    """
+    if not cases:
+        return []
+    lo = min(c["first"] for c in cases)
+    hi = max(c["last"] for c in cases)
+    all_buckets = _buckets_spanning(lo, hi, period)
+    paid = {b: 0 for b in all_buckets}
+    seo = {b: 0 for b in all_buckets}
+    for c in cases:
+        chans = c.get("channels", [])
+        for b in _buckets_spanning(c["first"], c["last"], period):
+            if "sponsored_ad" in chans:
+                paid[b] += 1
+            if "organic" in chans:
+                seo[b] += 1
+    rows = []
+    for i, b in enumerate(all_buckets):
+        b_start, b_end = bucket_bounds(b, period)
+        rows.append({
+            "bucket":  b,
+            "start":   max(b_start, lo).isoformat(),
+            "end":     min(b_end, hi).isoformat(),
+            "paid":    paid[b],
+            "seo":     seo[b],
+            "onset":   (i == 0),
+            "partial": b_start < lo or b_end > hi,
+        })
+    return rows
+
+
 def _has_complete_data(c: dict) -> bool:
     """Both engine and device known — the scope the device chart reports on."""
     return c["engine"] in ("google", "bing") and bool(c["devices"])

@@ -80,6 +80,49 @@ def test_trend_stacks_and_flags_partial_buckets(db):
     assert series[-1]["end"] == max(c["last"] for c in rd.load_cases(db)).isoformat()
 
 
+def test_channel_trend_splits_paid_and_seo(tmp_path):
+    """channel_trend counts active campaigns per period, split by channel, with
+    the same bucketing and partial/onset flags as trend()."""
+    path = str(tmp_path / "ct.db")
+    conn = fs.connect(path)
+
+    def add(fp, engine, host, first, last, channels):
+        conn.execute(
+            "INSERT INTO findings (fingerprint, engine, primary_host, first_seen, "
+            "last_seen, times_seen, raw_detections, devices_seen, queries_seen, "
+            "channels_seen, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'open')",
+            (fp, engine, host, first, last, 1, 1, "[]", "[]", json.dumps(channels)),
+        )
+
+    # A paid campaign spanning May–Jun, a SEO one in Jun, one reaching both ways.
+    add("bing:paid.com", "bing", "paid.com", "2026-05-10T10:00:00Z",
+        "2026-06-20T10:00:00Z", ["sponsored_ad"])
+    add("bing:seo.com", "bing", "seo.com", "2026-06-05T10:00:00Z",
+        "2026-06-25T10:00:00Z", ["organic"])
+    add("google:both.com", "google", "both.com", "2026-06-01T10:00:00Z",
+        "2026-06-30T10:00:00Z", ["sponsored_ad", "organic"])
+    conn.commit()
+    conn.close()
+
+    rows = rd.channel_trend(rd.load_cases(path), "month")
+    by_month = {r["bucket"]: r for r in rows}
+    # May: only the paid campaign is live.
+    assert by_month["2026-05"]["paid"] == 1
+    assert by_month["2026-05"]["seo"] == 0
+    # June: paid campaign + both-channel = 2 paid; seo campaign + both-channel = 2 seo.
+    assert by_month["2026-06"]["paid"] == 2
+    assert by_month["2026-06"]["seo"] == 2
+    # Same bucketing and honesty flags as trend(), bucket for bucket.
+    tr = rd.trend(rd.load_cases(path), "month")
+    assert [r["bucket"] for r in rows] == [r["bucket"] for r in tr]
+    assert [r["onset"] for r in rows] == [r["onset"] for r in tr]
+    assert [r["partial"] for r in rows] == [r["partial"] for r in tr]
+
+
+def test_channel_trend_empty_is_empty():
+    assert rd.channel_trend([], "month") == []
+
+
 def test_count_complete_data_is_campaigns_not_bar_total(db):
     cases = rd.load_cases(db)
     # A ran on desktop+mobile, B on desktop, C has no device -> 2 campaigns,
