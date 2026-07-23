@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from domainmatch import host_of
 
@@ -107,6 +108,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def connect(db_path: str) -> sqlite3.Connection:
     """Opens (creating if needed) the findings DB and ensures the schema."""
+    # sqlite3 creates the file but not its directory, so a FINDINGS_DB pointing
+    # at a not-yet-existing folder fails with a bare "unable to open database
+    # file". Create the parent first so the store works on a fresh checkout.
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute(_SCHEMA)

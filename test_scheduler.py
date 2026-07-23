@@ -36,17 +36,8 @@ def calls(monkeypatch):
         raise _StopLoop
 
     monkeypatch.setattr(C, "run_once", fake_run_once)
-
-    # Neutralize the scheduler registration — .do() would otherwise bind the
-    # real run_once, and we never let the loop run anyway.
-    class _Job:
-        def do(self, *a, **kw):
-            return self
-
-    class _Every:
-        minutes = property(lambda self: _Job())
-
-    monkeypatch.setattr(C.schedule, "every", lambda *a, **kw: _Every())
+    # The startup run_once fires first and raises _StopLoop, so the scheduling
+    # loop is never reached — no scheduler stubbing needed.
     return recorded
 
 
@@ -83,3 +74,43 @@ def test_startup_run_defaults_to_both_devices(calls):
 def test_startup_run_passes_active_engines(calls):
     got = _run(["bing"], [C.MOBILE_PROFILE], calls)
     assert got["active_engines"] == ["bing"]
+
+
+def test_scheduled_loop_fires_and_reschedules(monkeypatch):
+    """
+    Drive one iteration of the scheduling loop: after the startup run, a due
+    engine must fire a single-engine run_once and get a fresh next-fire time.
+    """
+    engine_runs = []
+
+    def fake_run_once(active_engines=None, device_profiles=None):
+        engine_runs.append(list(active_engines))
+
+    monkeypatch.setattr(C, "run_once", fake_run_once)
+    monkeypatch.setattr(C.time, "sleep", lambda *_: None)   # don't actually wait
+
+    # Force the engine immediately due so the loop fires on its first pass, and
+    # stop on the reschedule that follows the fire (the 2nd next-fire call).
+    reschedules = []
+
+    def fake_next_fire(engine, interval_min):
+        reschedules.append(engine)
+        if len(reschedules) >= 2:      # initial schedule, then post-fire reschedule
+            raise _StopLoop
+        return C.time.time() - 1       # in the past -> due now
+
+    monkeypatch.setattr(C, "_next_fire_for", fake_next_fire)
+
+    with pytest.raises(_StopLoop):
+        C.run_scheduled(
+            google_interval=240,
+            bing_interval=120,
+            active_engines=["google"],
+            device_profiles=[C.DESKTOP_PROFILE],
+        )
+
+    # Startup run (both/active), then a single-engine scheduled fire for google.
+    assert engine_runs[0] == ["google"]
+    assert engine_runs[1] == ["google"]
+    # Rescheduled at least twice: initial next_fire + after the fire.
+    assert reschedules.count("google") >= 2

@@ -30,12 +30,12 @@ import json
 import logging
 import os
 import re
+import random
 import smtplib
 import argparse
-import schedule
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -57,6 +57,27 @@ import url_resolve
 # ---------------------------------------------------------------------------
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Required path settings — sourced ONLY from the environment (.env), no
+# built-in fallbacks. A missing one is a hard, fail-fast error rather than a
+# silent fall-through to a placeholder that later breaks mid-run.
+# ---------------------------------------------------------------------------
+_REQUIRED_PATH_VARS = (
+    "PROFILE_DIR",    # persistent browser profile directory
+    "TRIAGE_FILE",    # analyst triage JSON
+    "EVIDENCE_DIR",   # evidence output directory
+    "FINDINGS_DB",    # SQLite campaign store
+    "LOG_FILE",       # log file
+)
+_missing_path_vars = [v for v in _REQUIRED_PATH_VARS if not os.getenv(v)]
+if _missing_path_vars:
+    raise SystemExit(
+        "[CONFIG] Missing required path setting(s): "
+        + ", ".join(_missing_path_vars)
+        + ".\nThese have no built-in defaults — copy env.example to .env and "
+        "set them (see the README 'Configure' section)."
+    )
 
 # ---------------------------------------------------------------------------
 # Brand terms to monitor
@@ -174,18 +195,18 @@ ALLOWLIST_DOMAINS = [
 # Persistent browser profile directory, created by setup_profile.py
 # Used for Google (consent cookie required). Bing does not require it
 # but benefits from the same profile for consistent fingerprinting.
-PROFILE_DIR  = os.getenv("PROFILE_DIR",  "/path/to/browser_profile/")
+PROFILE_DIR  = os.getenv("PROFILE_DIR")
 
 # Analyst triage list: JSON file of benign third-party domains
 # Shared across both search engines; a triaged domain is suppressed everywhere
-TRIAGE_FILE  = os.getenv("TRIAGE_FILE",  "/path/to/triaged_domains/")
+TRIAGE_FILE  = os.getenv("TRIAGE_FILE")
 
 # Output directory for evidence artifacts
-EVIDENCE_DIR = Path(os.getenv("EVIDENCE_DIR", "/path/to/evidence_directory"))
+EVIDENCE_DIR = Path(os.getenv("EVIDENCE_DIR"))
 
 # SQLite campaign store: dedup + case identity + first/last-seen (v7, Lens #1
 # gap #4). Seed historical first_seen dates once with backfill_findings.py.
-FINDINGS_DB = os.getenv("FINDINGS_DB", "/path/to/findings.db")
+FINDINGS_DB = os.getenv("FINDINGS_DB")
 
 # Ads Transparency Center enrichment. Looks up each flagged destination
 # domain in adstransparency.google.com, which is searchable by domain and
@@ -212,7 +233,7 @@ ALERT_TO_LIST = [a.strip() for a in ALERT_TO_RAW.split(",") if a.strip()]
 ALERT_TO      = ", ".join(ALERT_TO_LIST)
 
 # Log file
-LOG_FILE = os.getenv("LOG_FILE", "brand_monitor.log")
+LOG_FILE = os.getenv("LOG_FILE")
 
 # ---------------------------------------------------------------------------
 # Browser fingerprint profiles
@@ -274,6 +295,53 @@ DOM_MIN_BYTES = 50_000
 
 # URL used to probe Google profile health
 HEALTH_CHECK_URL = "https://www.google.com/search?q=weather"
+
+# ---------------------------------------------------------------------------
+# Google rate-block ("/sorry" unusual-traffic) cooldown
+# ---------------------------------------------------------------------------
+# Querying Google from a datacenter IP (a VM whose IP resolves to Google's own
+# ASN is the worst case) trips Google's /sorry reCAPTCHA after only a few runs.
+# brand_monitor.log shows the pattern plainly:
+#   2026-07-12  10 consecutive HOURLY runs, ALL walled — continuing to query
+#               while blocked kept the block alive for 9+ hours.
+#   2026-07-16  walled at 09:32, paused, clean again by 12:23 (<~3h) — STOPPING
+#               lets the block clear on its own in minutes-to-hours.
+# So on detection we PAUSE Google entirely for a cooldown and let the IP cool
+# off, backing off exponentially if the next probe still finds it blocked. Bing
+# is not rate-blocked here and keeps running throughout. Tunable via env.
+GOOGLE_COOLDOWN_BASE_MIN = int(os.getenv("GOOGLE_COOLDOWN_BASE_MIN", "180"))  # first block: 3h
+GOOGLE_COOLDOWN_MAX_MIN  = int(os.getenv("GOOGLE_COOLDOWN_MAX_MIN",  "720"))  # cap: 12h
+
+# Small JSON file recording the current cooldown so a process restart does not
+# immediately re-hammer a still-blocked IP. Defaults next to the findings DB.
+COOLDOWN_STATE_FILE = os.getenv(
+    "COOLDOWN_STATE_FILE",
+    str(Path(FINDINGS_DB).parent / "cooldown_state.json"),
+)
+
+# ---------------------------------------------------------------------------
+# Traffic-shaping jitter (scheduled mode)
+# ---------------------------------------------------------------------------
+# A machine-perfect cadence (identical intervals, bursts of queries fired in a
+# few seconds) is itself an automation signal. These spread traffic out so it
+# reads less like a bot, WITHOUT adding request volume (which would only make
+# the rate block worse). All tunable via env.
+
+# Inter-run interval jitter as a FRACTION of the base interval — proportional,
+# so it scales with the interval and never collapses to zero. ±20% default.
+SCHEDULE_JITTER_FRAC = float(os.getenv("SCHEDULE_JITTER_FRAC", "0.20"))
+
+# Within-run gap between individual brand-term queries, seconds (uniform range).
+# Brand terms are also shuffled per run. Set both to 0 to disable.
+WITHIN_RUN_JITTER_MIN = float(os.getenv("WITHIN_RUN_JITTER_MIN", "20"))
+WITHIN_RUN_JITTER_MAX = float(os.getenv("WITHIN_RUN_JITTER_MAX", "40"))
+
+# After a Google cooldown expires, wait up to this many minutes (uniform) before
+# the resume-probe fires, so recovery is quick but not to-the-second predictable.
+GOOGLE_RESUME_JITTER_MIN = float(os.getenv("GOOGLE_RESUME_JITTER_MIN", "15"))
+
+# Scheduler poll granularity, seconds. How often the loop checks for due runs.
+SCHEDULE_POLL_SECONDS = int(os.getenv("SCHEDULE_POLL_SECONDS", "60"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -564,6 +632,122 @@ def is_triaged(host: str | None, triaged_domains: set[str]) -> bool:
     return host_in(host, triaged_domains, exact=True)
 
 # ---------------------------------------------------------------------------
+# Google rate-block detection + cooldown state
+# ---------------------------------------------------------------------------
+# classify_wall distinguishes the two small-DOM failure modes, because they
+# need OPPOSITE fixes:
+#   "rate_block"  Google's /sorry unusual-traffic reCAPTCHA (IP reputation).
+#                 Fix: stop querying and wait it out — hence the cooldown.
+#   "consent"     GDPR consent interstitial (consent.google.com).
+#                 Fix: re-run setup_profile.py to re-accept and re-save cookies.
+# The discriminator lives in the URL, not the title: /sorry pages carry a
+# "sei=" token under the /sorry path; consent redirects to consent.google.com.
+
+def classify_wall(dom_size: int, title: str, url: str) -> str | None:
+    """
+    Classifies a possibly-walled Google page. Returns:
+      None          — DOM is a healthy SERP, no wall.
+      "consent"     — GDPR consent interstitial; needs setup_profile.py.
+      "rate_block"  — /sorry IP rate block; needs a cooldown.
+      "unknown"     — tiny DOM of indeterminate cause; treated as a rate block
+                      (fail safe: pause rather than hammer) but surfaced so an
+                      operator can rule out a genuine profile problem.
+    """
+    if dom_size >= DOM_MIN_BYTES:
+        return None
+    hay = f"{title}\n{url}".lower()
+    if "consent.google" in hay or "before you continue" in hay:
+        return "consent"
+    if "/sorry" in hay or "sei=" in hay or "unusual traffic" in hay:
+        return "rate_block"
+    return "unknown"
+
+
+def _fmt_minutes(total_minutes: float) -> str:
+    m = int(round(total_minutes))
+    if m < 60:
+        return f"{m}m"
+    return f"{m // 60}h{m % 60:02d}m" if m % 60 else f"{m // 60}h"
+
+
+def _load_cooldown_state() -> dict:
+    """Reads the cooldown state file. Fails OPEN: any error -> no cooldown."""
+    try:
+        return json.loads(Path(COOLDOWN_STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_cooldown_state(state: dict) -> None:
+    """Writes the cooldown state file. Fails OPEN: an I/O error never raises."""
+    try:
+        p = Path(COOLDOWN_STATE_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"[COOLDOWN] Could not persist cooldown state: {e}")
+
+
+def google_cooldown_remaining() -> float:
+    """
+    Seconds of Google cooldown left, or 0.0 if Google may be queried now.
+    Reads the state file each call so a restarted process still honours an
+    active cooldown. Fails OPEN.
+    """
+    state = _load_cooldown_state().get("google", {})
+    until = state.get("cooldown_until")
+    if not until:
+        return 0.0
+    try:
+        until_dt = datetime.fromisoformat(until)
+    except Exception:
+        return 0.0
+    remaining = (until_dt - datetime.now(timezone.utc)).total_seconds()
+    return remaining if remaining > 0 else 0.0
+
+
+def register_google_block(reason: str, url: str = "") -> str:
+    """
+    Records a Google rate block and sets/extends the cooldown, backing off
+    exponentially on consecutive blocks (BASE, 2*BASE, 4*BASE ... capped at
+    MAX). Called once per detecting run — at most once by the health probe or
+    once by the live scrape — so each still-blocked probe escalates one step.
+    Returns a human-readable cooldown duration for logging.
+    """
+    state = _load_cooldown_state()
+    g = state.get("google", {})
+    consecutive = int(g.get("consecutive_blocks", 0)) + 1
+    minutes = min(GOOGLE_COOLDOWN_BASE_MIN * (2 ** (consecutive - 1)),
+                  GOOGLE_COOLDOWN_MAX_MIN)
+    now = datetime.now(timezone.utc)
+    state["google"] = {
+        "consecutive_blocks": consecutive,
+        "last_block":         now.isoformat(),
+        "last_reason":        reason,
+        "last_url":           url,
+        "cooldown_until":     (now + timedelta(minutes=minutes)).isoformat(),
+    }
+    _save_cooldown_state(state)
+    return _fmt_minutes(minutes)
+
+
+def note_google_ok() -> None:
+    """
+    Clears any Google cooldown after a confirmed-healthy Google probe. No-op
+    (and no write) when there was no cooldown, so a steady healthy state does
+    not churn the state file.
+    """
+    state = _load_cooldown_state()
+    if state.get("google"):
+        prev = int(state["google"].get("consecutive_blocks", 0))
+        state.pop("google", None)
+        _save_cooldown_state(state)
+        if prev:
+            log.info("[COOLDOWN] Google probe healthy — cooldown cleared after "
+                     f"{prev} block(s); resuming normal Google checks.")
+
+
+# ---------------------------------------------------------------------------
 # Profile health checks
 # ---------------------------------------------------------------------------
 
@@ -651,30 +835,15 @@ def check_cookie_expiry() -> tuple[bool, str]:
     return True, f"Cookie health OK — {google_seen} Google cookie(s) checked."
 
 
-def check_dom_size(dom_size: int, title: str, engine_key: str = "google") -> tuple[bool, str]:
-    """
-    Evaluates a pre-measured DOM size against the health threshold.
-    """
-    if dom_size < DOM_MIN_BYTES:
-        return False, (
-            f"[{engine_key.upper()}] DOM size {dom_size:,} bytes "
-            f"(minimum {DOM_MIN_BYTES:,}). "
-            f"Page title: '{title}'. "
-            "Google is likely serving a consent wall. "
-            "Run setup_profile.py to refresh the profile."
-        )
-    return True, (
-        f"[{engine_key.upper()}] DOM size {dom_size:,} bytes — '{title[:60]}'"
-    )
-
-
-async def probe_dom_size() -> tuple[int, str]:
+async def probe_dom_size() -> tuple[int, str, str]:
     """
     Opens a browser session and measures the Google SERP DOM size.
-    Called only on the first run subsequent runs use live measurements.
+    Returns (dom_size, page_title, final_url). The final URL is what lets
+    classify_wall tell a /sorry rate block (sei= token) from a consent
+    interstitial (consent.google.com) — the title alone is ambiguous.
     """
     if not Path(PROFILE_DIR).exists():
-        return 0, "profile directory missing"
+        return 0, "profile directory missing", ""
 
     try:
         async with async_playwright() as p:
@@ -702,50 +871,71 @@ async def probe_dom_size() -> tuple[int, str]:
                 await asyncio.sleep(2)
                 dom_size = len(await page.content())
                 title    = await page.title()
+                final_url = page.url
             finally:
                 await context.close()
-        return dom_size, title
+        return dom_size, title, final_url
     except Exception as e:
         log.warning(f"[HEALTH] DOM probe error: {e}")
-        return 0, str(e)
+        return 0, str(e), ""
 
 
-def run_profile_health_checks(dom_size: int = 0, title: str = "") -> bool:
+def run_google_health_check() -> bool:
     """
-    Runs cookie expiry check and DOM size evaluation.
-    DOM probe is the authoritative gate cookie issues are advisory.
-    Returns True if healthy, False if setup_profile.py needs to be run.
-    """
-    all_healthy  = True
-    dom_fail_msg = None
+    Probes Google once and decides whether Google should be scraped this run.
+    Returns True if Google is healthy, False if it must be skipped.
 
+    A fresh probe is always taken (no cross-engine caching): the verdict must
+    reflect Google specifically, not the largest DOM seen last run (which could
+    have been Bing). On a small DOM, classify_wall routes by cause:
+      consent    -> operator alert to re-run setup_profile.py (Google skipped)
+      rate_block -> cooldown registered, Google paused (see register_google_block)
+      unknown    -> cooldown AND an operator alert, so a misclassified profile
+                    problem still reaches a human instead of silently escalating
+    Cookie expiry remains advisory. Other engines (Bing) are never gated on
+    this — the caller drops only Google when this returns False.
+    """
     cookie_ok, cookie_msg = check_cookie_expiry()
     if cookie_ok:
         log.info(f"[HEALTH] {cookie_msg}")
     else:
         log.warning(f"[HEALTH] {cookie_msg}")
 
-    if dom_size > 0:
-        dom_ok, dom_msg = check_dom_size(dom_size, title, "google")
-    else:
-        log.info("[HEALTH] Running DOM probe (first run)...")
-        measured_size, measured_title = asyncio.run(probe_dom_size())
-        dom_ok, dom_msg = check_dom_size(measured_size, measured_title, "google")
+    log.info("[HEALTH] Running Google DOM probe...")
+    dom_size, title, url = asyncio.run(probe_dom_size())
+    wall = classify_wall(dom_size, title, url)
 
-    if dom_ok:
-        log.info(f"[HEALTH] {dom_msg}")
-    else:
-        log.error(f"[HEALTH] {dom_msg}")
-        all_healthy  = False
-        dom_fail_msg = dom_msg
+    if wall is None:
+        log.info(f"[HEALTH] [GOOGLE] DOM size {dom_size:,} bytes — '{title[:60]}'")
+        note_google_ok()
+        return True
 
-    if not all_healthy:
+    if wall == "consent":
+        msg = (
+            f"[GOOGLE] DOM size {dom_size:,} bytes (minimum {DOM_MIN_BYTES:,}) — "
+            f"consent interstitial (url: {url[:120]}). "
+            "Run setup_profile.py to re-accept consent and refresh the profile."
+        )
+        log.error(f"[HEALTH] {msg}")
+        _send_profile_alert(cookie_msg if not cookie_ok else None, msg)
+        return False
+
+    # rate_block or unknown -> pause Google and cool the IP off.
+    cooldown = register_google_block(wall, url)
+    log.error(
+        f"[HEALTH] [GOOGLE] {wall} detected (DOM {dom_size:,} bytes, "
+        f"url: {url[:120]}) — pausing Google for {cooldown}. "
+        "This is an IP rate block, not a profile problem: setup_profile.py "
+        "will NOT help; the IP must cool off (or move Google off this IP)."
+    )
+    if wall == "unknown":
         _send_profile_alert(
             cookie_msg if not cookie_ok else None,
-            dom_fail_msg,
+            f"[GOOGLE] Tiny Google DOM ({dom_size:,} bytes) of unknown cause "
+            f"(url: {url[:120]}). Treated as a rate block and Google paused for "
+            f"{cooldown}, but please verify this is not a browser-profile issue.",
         )
-
-    return all_healthy
+    return False
 
 
 def _send_profile_alert(cookie_msg: str | None, dom_msg: str | None) -> None:
@@ -2058,14 +2248,17 @@ async def run_checks(
     the desktop context; the panel DOM structure differs on mobile and the
     existing selectors target the desktop layout.
 
-    Returns (flagged_ads, last_dom_size, last_page_title).
+    Returns (flagged_ads, last_dom_size, last_page_title, google_blocked).
+    google_blocked is True if Google tripped its /sorry rate block mid-run, so
+    the caller can register a cooldown.
     """
     if device_profiles is None:
         device_profiles = DEVICE_PROFILES
 
-    all_flagged   = []
-    last_dom_size = 0
-    last_title    = ""
+    all_flagged    = []
+    last_dom_size  = 0
+    last_title     = ""
+    google_blocked = False
 
     if not Path(PROFILE_DIR).exists():
         raise RuntimeError(
@@ -2100,8 +2293,27 @@ async def run_checks(
             page = await context.new_page()
             await Stealth().apply_stealth_async(page)
 
+            # first_query spans engines within this context so the human-plausible
+            # gap sits between every query, not just within one engine.
+            first_query = True
+
             for engine_key in active_engines:
-                for term in BRAND_TERMS:
+                # Once Google trips its /sorry rate block, stop querying it for
+                # the rest of this run (including later device contexts): every
+                # extra hit sustains the block (see brand_monitor.log 2026-07-12).
+                if engine_key == "google" and google_blocked:
+                    continue
+                # Shuffle terms per run so the query order is not a fixed pattern.
+                terms = list(BRAND_TERMS)
+                random.shuffle(terms)
+                for term in terms:
+                    # Human-plausible gap between queries (not before the first);
+                    # a burst fired in a few seconds is a strong bot signal.
+                    if not first_query and WITHIN_RUN_JITTER_MAX > 0:
+                        await asyncio.sleep(
+                            random.uniform(WITHIN_RUN_JITTER_MIN, WITHIN_RUN_JITTER_MAX)
+                        )
+                    first_query = False
                     try:
                         flagged = await check_sponsored_ads(
                             term, page, engine_key,
@@ -2109,11 +2321,25 @@ async def run_checks(
                         )
                         all_flagged.extend(flagged)
 
-                        # Track largest DOM size seen, used for health check
+                        # Track largest DOM size seen (diagnostic only).
                         dom = await page.content()
                         if len(dom) > last_dom_size:
                             last_dom_size = len(dom)
                             last_title    = await page.title()
+
+                        # Live rate-block detection: a block can appear mid-run
+                        # after a clean startup probe. Catch it and bail out of
+                        # Google immediately rather than walking the rest of the
+                        # brand terms into the wall.
+                        if engine_key == "google" and len(dom) < DOM_MIN_BYTES:
+                            wall = classify_wall(len(dom), await page.title(), page.url)
+                            if wall in ("rate_block", "unknown"):
+                                log.warning(
+                                    f"[GOOGLE][{label}] {wall} detected mid-run on "
+                                    f"'{term}' — stopping Google for this run."
+                                )
+                                google_blocked = True
+                                break
 
                     except Exception as e:
                         log.error(
@@ -2124,7 +2350,7 @@ async def run_checks(
             await context.close()
             log.info(f"[{label}] Context closed.")
 
-    return all_flagged, last_dom_size, last_title
+    return all_flagged, last_dom_size, last_title, google_blocked
 
 # ---------------------------------------------------------------------------
 # Alert email
@@ -2611,12 +2837,42 @@ def send_alert(flagged_ads: list[dict], run_timestamp: str) -> None:
 def run_once(
     active_engines: list[str] | None = None,
     device_profiles: list[dict] | None = None,
+    ignore_cooldown: bool = False,
 ) -> None:
-    """Single execution: start virtual display, run checks, alert, stop."""
+    """Single execution: start virtual display, run checks, alert, stop.
+
+    ignore_cooldown=True runs Google even if it is in a rate-block cooldown
+    (a manual "has it lifted yet?" check). The scheduler never sets it — a
+    timer must respect the cooldown or it just sustains the block.
+    """
     if active_engines is None:
         active_engines = ACTIVE_ENGINES
     if device_profiles is None:
         device_profiles = DEVICE_PROFILES
+
+    # Google rate-block cooldown gate. If Google is paused, drop it from this
+    # run but let other engines (Bing) proceed. Done before the display starts
+    # so a Google-only run during cooldown is a cheap no-op.
+    active_engines = list(active_engines)
+    if "google" in active_engines:
+        remaining = google_cooldown_remaining()
+        if remaining > 0 and ignore_cooldown:
+            log.warning(
+                f"[COOLDOWN] Google is in cooldown for another "
+                f"{_fmt_minutes(remaining / 60)}, but --ignore-cooldown was set "
+                "— probing Google anyway."
+            )
+        elif remaining > 0:
+            log.warning(
+                f"[COOLDOWN] Google paused for another {_fmt_minutes(remaining / 60)} "
+                "(IP rate block) — skipping Google this run. "
+                "Use --ignore-cooldown to force a manual check."
+            )
+            active_engines = [e for e in active_engines if e != "google"]
+    if not active_engines:
+        log.info("[COOLDOWN] Nothing to run this cycle (Google paused, no other "
+                 "engine active). Skipping.")
+        return
 
     ensure_evidence_dir()
     run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2632,25 +2888,36 @@ def run_once(
     try:
         log.info(f"Running checks on: {[e.upper() for e in active_engines]}")
         log.info(f"Device profiles: {[p['label'].upper() for p in device_profiles]}")
-        log.info("Running profile health checks...")
-
-        profile_healthy = run_profile_health_checks(
-            dom_size=getattr(run_once, "_last_dom_size", 0),
-            title=getattr(run_once, "_last_title", ""),
-        )
-        if not profile_healthy:
-            log.error(
-                "Profile health check failed — skipping ad detection. "
-                "Run setup_profile.py from a desktop session to refresh the profile."
+        if WITHIN_RUN_JITTER_MAX > 0:
+            log.info(
+                f"Within-run jitter: terms shuffled, "
+                f"{WITHIN_RUN_JITTER_MIN:.0f}-{WITHIN_RUN_JITTER_MAX:.0f}s between queries"
             )
+        else:
+            log.info("Within-run jitter: disabled")
+
+        # Google-only health gate: probe Google, and on a wall drop ONLY Google
+        # (never Bing). A rate block registers a cooldown inside the check.
+        if "google" in active_engines:
+            log.info("Running Google health check...")
+            if not run_google_health_check():
+                active_engines = [e for e in active_engines if e != "google"]
+                log.warning("Google dropped from this run; continuing with "
+                            f"{[e.upper() for e in active_engines] or 'nothing'}.")
+        if not active_engines:
+            log.info("No engines left to run after health check. Skipping.")
             return
 
-        flagged, dom_size, title = asyncio.run(
+        flagged, dom_size, title, google_blocked = asyncio.run(
             run_checks(active_engines, device_profiles=device_profiles)
         )
 
-        run_once._last_dom_size = dom_size
-        run_once._last_title    = title
+        # A block can appear mid-run after a clean startup probe; register the
+        # cooldown so the next cycles pause Google instead of hammering it.
+        if google_blocked:
+            cooldown = register_google_block("rate_block")
+            log.error(f"[COOLDOWN] Google rate block hit mid-run — pausing "
+                      f"Google for {cooldown}.")
 
         # Attribution capture health; alerts operator on selector drift (v7).
         _report_attribution_health()
@@ -2718,6 +2985,39 @@ def run_once(
         log.info("Virtual display stopped")
 
 
+def _jittered_interval(base_min: float, jitter_frac: float) -> float:
+    """
+    Base interval (minutes) +/- jitter_frac, returned in SECONDS and floored at
+    60s. Proportional jitter breaks the machine-perfect cadence that itself
+    reads as automation. jitter_frac <= 0 disables jitter.
+    """
+    base_sec = base_min * 60
+    if jitter_frac <= 0:
+        return max(base_sec, 60.0)
+    offset = base_sec * jitter_frac
+    return max(random.uniform(base_sec - offset, base_sec + offset), 60.0)
+
+
+def _next_fire_for(engine: str, interval_min: float) -> float:
+    """
+    Epoch seconds for an engine's next scheduled run.
+
+    Google honours an active cooldown: after a /sorry block, the next attempt is
+    a RESUME-PROBE fired just after the cooldown expires (cooldown_until + a
+    small jitter), not a full interval later — so visibility returns as soon as
+    the IP is likely clear, without hammering it early. If the probe finds it
+    still blocked, run_once re-registers an escalated cooldown and this reschedules
+    off the new expiry. Outside a cooldown, a proportionally-jittered interval is
+    used. Bing always uses the jittered interval.
+    """
+    now = time.time()
+    if engine == "google":
+        remaining = google_cooldown_remaining()
+        if remaining > 0:
+            return now + remaining + random.uniform(0, GOOGLE_RESUME_JITTER_MIN * 60)
+    return now + _jittered_interval(interval_min, SCHEDULE_JITTER_FRAC)
+
+
 def run_scheduled(
     google_interval: int,
     bing_interval: int,
@@ -2725,22 +3025,23 @@ def run_scheduled(
     device_profiles: list[dict] | None = None,
 ) -> None:
     """
-    Runs checks on independent per-engine schedules.
+    Runs checks on independent, jittered, per-engine schedules.
 
     Intervals are specified in MINUTES so sub-hour values (e.g. 30) are
-    supported without decimal arguments.
+    supported without decimal arguments. Each firing is offset by a random
+    +/-SCHEDULE_JITTER_FRAC of the base interval (default +/-20%), so the cadence
+    is not machine-perfect. Volume is unchanged — jitter only moves WHEN a run
+    fires, never adds runs.
 
-    Google: 240 minute (4h) minimum recommended. Session fingerprinting
-             suppresses ad delivery on frequent repeat searches from the
-             same profile. Running more often risks silent false-negatives.
+    Google: 240 minute (4h) base recommended. It also self-throttles on a rate
+             block via the cooldown + resume-probe (see _next_fire_for), so a
+             block pauses Google and it resumes right after the IP is likely
+             clear rather than a full interval later.
 
-    Bing:   30-120 minute intervals are safe. No observed consent wall,
-             less aggressive bot detection, and no frequency capping
-             behavior comparable to Google. More frequent checks increase
-             the probability of catching short-lived campaigns.
+    Bing:   30-120 minute intervals are safe. No observed rate block.
 
-    Each engine runs independently; a Google check does not block or
-    delay a scheduled Bing check, and vice versa.
+    Each engine runs independently; a Google check does not block or delay a
+    scheduled Bing check, and a Google cooldown never pauses Bing.
 
     device_profiles is passed through unchanged to every scheduled firing;
     if restricted via --device desktop / --device mobile, the schedule runs
@@ -2749,41 +3050,44 @@ def run_scheduled(
     if device_profiles is None:
         device_profiles = DEVICE_PROFILES
 
-    def fmt(mins):
-        return f"{mins}m" if mins < 60 else f"{mins // 60}h" if mins % 60 == 0 else f"{mins // 60}h{mins % 60}m"
+    intervals = {"google": google_interval, "bing": bing_interval}
+    engines   = [e for e in ("google", "bing") if e in active_engines]
 
-    if "google" in active_engines and "bing" in active_engines:
+    log.info(
+        "Scheduled mode: " + ", ".join(
+            f"{e.upper()} every ~{_fmt_minutes(intervals[e])} "
+            f"(±{int(SCHEDULE_JITTER_FRAC * 100)}% jitter)"
+            for e in engines
+        )
+    )
+    if "google" in engines:
         log.info(
-            f"Scheduled mode: GOOGLE every {fmt(google_interval)}, "
-            f"BING every {fmt(bing_interval)}"
-        )
-        schedule.every(google_interval).minutes.do(
-            run_once, active_engines=["google"], device_profiles=device_profiles
-        )
-        schedule.every(bing_interval).minutes.do(
-            run_once, active_engines=["bing"], device_profiles=device_profiles
-        )
-    elif "google" in active_engines:
-        log.info(f"Scheduled mode: GOOGLE every {fmt(google_interval)}")
-        schedule.every(google_interval).minutes.do(
-            run_once, active_engines=["google"], device_profiles=device_profiles
-        )
-    elif "bing" in active_engines:
-        log.info(f"Scheduled mode: BING every {fmt(bing_interval)}")
-        schedule.every(bing_interval).minutes.do(
-            run_once, active_engines=["bing"], device_profiles=device_profiles
+            f"[SCHEDULE] Google resume-probe fires within {_fmt_minutes(GOOGLE_RESUME_JITTER_MIN)} "
+            "of a cooldown expiring."
         )
 
-    # Run all active engines immediately on startup, then follow schedule.
+    # Run all active engines immediately on startup, then follow the schedule.
     # device_profiles must be passed explicitly: omitting it makes run_once fall
     # back to DEVICE_PROFILES (both devices), so a --device mobile schedule would
     # still open a desktop context on its very first run, the one run an
     # operator is most likely to be watching.
     run_once(active_engines=active_engines, device_profiles=device_profiles)
 
+    # Per-engine next-fire wall-clock times (epoch seconds).
+    next_fire = {e: _next_fire_for(e, intervals[e]) for e in engines}
+    for e in engines:
+        log.info(f"[SCHEDULE] Next {e.upper()} run in "
+                 f"~{_fmt_minutes((next_fire[e] - time.time()) / 60)}.")
+
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        time.sleep(SCHEDULE_POLL_SECONDS)
+        now = time.time()
+        for e in engines:
+            if now >= next_fire[e]:
+                run_once(active_engines=[e], device_profiles=device_profiles)
+                next_fire[e] = _next_fire_for(e, intervals[e])
+                log.info(f"[SCHEDULE] Next {e.upper()} run in "
+                         f"~{_fmt_minutes((next_fire[e] - time.time()) / 60)}.")
 
 
 if __name__ == "__main__":
@@ -2827,6 +3131,10 @@ Examples:
   # Bing every hour, Google every 4 hours
   python serp_monitor.py --schedule --google-interval 240 --bing-interval 60
 
+  # Force a one-off Google check even if it is in a rate-block cooldown
+  # (e.g. to see whether the block has lifted). Ignored by --schedule.
+  python serp_monitor.py --engine google --ignore-cooldown
+
   # Mark a false positive domain as triaged (suppressed everywhere)
   python serp_monitor.py --triage example-partner.org
 
@@ -2843,6 +3151,15 @@ Notes:
     life of the process.
   - --schedule runs Google and Bing on independent timers in the same
     process; without --schedule the script performs a single run and exits.
+    Each interval is jittered by +/-SCHEDULE_JITTER_FRAC (default 20%) and
+    brand terms are shuffled per run, so the cadence is not machine-perfect.
+  - Google auto-throttles on a "/sorry" rate block: it pauses Google only
+    (Bing keeps running), waits out a cooldown that backs off exponentially,
+    and resumes with a probe just after the cooldown expires. Tune it with
+    GOOGLE_COOLDOWN_BASE_MIN / GOOGLE_COOLDOWN_MAX_MIN in .env.
+  - --ignore-cooldown forces Google to run despite an active cooldown, for a
+    manual "has the block lifted?" check. It is ignored by --schedule, which
+    must respect the cooldown or it would only sustain the block.
   - --triage and --list-triage are one-shot utility actions: the script
     performs the requested action and exits without running ad detection.
         """
@@ -2925,6 +3242,15 @@ Notes:
             "One-shot action — does not run ad detection."
         ),
     )
+    parser.add_argument(
+        "--ignore-cooldown",
+        action="store_true",
+        help=(
+            "Run Google even if it is in a rate-block cooldown. For a one-off "
+            "manual check of whether the block has lifted; ignored by --schedule, "
+            "which must respect the cooldown to avoid sustaining the block."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve active engines from --engine flag
@@ -2970,4 +3296,5 @@ Notes:
         )
 
     else:
-        run_once(active_engines=active, device_profiles=devices)
+        run_once(active_engines=active, device_profiles=devices,
+                 ignore_cooldown=args.ignore_cooldown)
