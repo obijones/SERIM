@@ -24,6 +24,9 @@ triaged_domains.json
 *.sqlite3
 *.log
 
+# Google rate-block cooldown state, written at runtime.
+cooldown_state.json
+
 # Python bytecode and build output.
 __pycache__/
 *.py[cod]

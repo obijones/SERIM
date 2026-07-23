@@ -55,7 +55,7 @@ def test_resolve_and_no_resolve_map_to_same_case():
 def test_different_destinations_are_distinct_cases():
     # One display domain fanning out to two landing pages = two takedown targets.
     a = fs.fingerprint_of(ad(dest="https://phish-example-2.info", disp="phish-example-2.info"))[0]
-    b = fs.fingerprint_of(ad(dest="https://frotsresuryconnetc.top", disp="phish-example-2.info"))[0]
+    b = fs.fingerprint_of(ad(dest="https://phish-example-3.top", disp="phish-example-2.info"))[0]
     assert a != b
 
 

@@ -15,9 +15,6 @@ playwright-stealth>=2.0.3
 # Virtual display (Python wrapper around system xvfb — replaces xvfb-run)
 PyVirtualDisplay>=3.0
  
-# In-process scheduling (used with --schedule flag)
-schedule>=1.2.2
- 
 # Environment variable management
 python-dotenv>=1.0.1
 
