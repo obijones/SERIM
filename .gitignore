@@ -15,6 +15,7 @@ browser_profile/
 evidence/
 reports/
 triaged_domains.json
+known_fi.json
 *_flagged.json
 
 # Databases and logs written at runtime.
@@ -63,3 +64,6 @@ desktop.ini
 # Backups.
 *.bak
 *.orig
+
+# Claude Code local settings and its atomic-write temp files.
+.claude/settings.local.json*

@@ -17,6 +17,8 @@ Serim watches Google and Bing search results and flags ads and pages that preten
 
 A result is treated as impersonation when the title claims your brand and the landing domain is not on your allowlist. The search terms are meant to be broad, so an unrelated business that happens to share a word with your brand is expected and is not counted as an offense. The matching logic lives in `brandmatch.py` and is covered by unit tests.
 
+Because the terms are broad, real financial institutions show up too. They are kept out of the report metrics through a registry of vetted institutions, and anything nobody has adjudicated is reported as its own number rather than counted as a threat — see [Legitimate institutions and the three review states](#legitimate-institutions-and-the-three-review-states).
+
 ## Requirements
 
 * Python 3.10 or newer.
@@ -47,6 +49,8 @@ sudo apt install xvfb
    The five path settings — `PROFILE_DIR`, `EVIDENCE_DIR`, `TRIAGE_FILE`, `FINDINGS_DB`, and `LOG_FILE` — are **required and have no built-in defaults**. They are read only from the environment (`.env`), and `serp_monitor.py` exits at startup, naming any that are missing, rather than falling back to a placeholder path. Set all five.
 
    The database itself needs no setup. `FINDINGS_DB` just names a file path, and the store creates the file and its schema on the first run. If that path is left unset or points somewhere unwritable, the run still completes and alerts still send, but you will see `Campaign store update failed (continuing without dedup)` and that run gets no first seen or last seen grouping.
+
+   `FI_REGISTRY_FILE` is optional — see [Legitimate institutions](#legitimate-institutions-and-the-three-review-states). Leaving it unset is safe: every non-infringing finding is then reported as unreviewed rather than quietly cleared.
 
 2. Open `serp_monitor.py` and set two things near the top:
 
@@ -81,12 +85,58 @@ python serp_monitor.py --schedule --google-interval 240 --bing-interval 120
 python serp_monitor.py --engine google --ignore-cooldown  # force a Google check during a cooldown
 python serp_monitor.py --triage example.com  # mark a domain as reviewed and benign
 python serp_monitor.py --list-triage         # show the triage list
+python serp_monitor.py --list-legitimate     # show the known-institution registry
 python serp_monitor.py --help                # full list of options
+
+# record a real financial institution so it stops counting toward the metrics
+python serp_monitor.py --mark-legitimate examplebank.com \
+    --institution "Example Bank, N.A." --basis "FDIC cert 12345" --analyst jdoe
 ```
 
 When you mark a domain with `--triage`, it is suppressed on both engines and both devices from then on.
 
 In `--schedule` mode, Google auto-pauses on a rate block and each run is jittered — see [Google rate limiting](#google-rate-limiting) below. Use `--ignore-cooldown` for a one-off manual check of whether a Google block has lifted. The cooldown and jitter behaviour is tuned with the `GOOGLE_COOLDOWN_*`, `SCHEDULE_JITTER_FRAC`, `WITHIN_RUN_JITTER_*`, and `GOOGLE_RESUME_JITTER_MIN` variables in `.env` (see `env.example`).
+
+## Legitimate institutions and the three review states
+
+The search terms are deliberately generic ("account login", "online portal"), so real licensed financial institutions bid and rank on them. They are not offences, but they were still being counted as campaigns in every report metric — on one 113-case store, 90 cases (80%) were non-infringing, and most of that was legitimate competitors.
+
+Every finding now lands in exactly one of three states:
+
+| State | What it means | Counts as a threat |
+|---|---|---|
+| **threat** | The title claims a brand term and the destination is not a domain you own | Yes |
+| **legitimate** | The host is on the known-institution registry | No — excluded, and reported as a named exclusion |
+| **unreviewed** | Neither of the above | No — reported as an analyst work queue |
+
+**Unreviewed is not an all-clear.** It means only that the title did not claim a brand term, so it holds legitimate businesses nobody has adjudicated yet *and* any real threat that left your name out of its title. It is reported as its own number rather than folded in with the legitimate results, so a gap in detection stays visible instead of being buried.
+
+### The registry
+
+Record an institution once, with the reason you trust it:
+
+```
+python serp_monitor.py --mark-legitimate examplebank.com \
+    --institution "Example Bank, N.A." --basis "FDIC cert 12345" --analyst jdoe
+
+python serp_monitor.py --list-legitimate
+```
+
+The domain **and its subdomains** stop counting toward the metrics, because a real institution serves `www.`, `secure.` and `locator.` hosts off one registered domain. Matching is on label boundaries, so `evilexamplebank.com` and `examplebank.com.evil.ru` do not inherit that legitimacy.
+
+Registered institutions keep being collected. Only the metrics change — a real institution's domain can be compromised later, and if collection stopped you would never see it.
+
+This is a third list, deliberately separate from the two that already existed:
+
+| | Means | Matching | Records why |
+|---|---|---|---|
+| `ALLOWLIST_DOMAINS` | "we own this" | subdomains | — |
+| `triaged_domains.json` | "an analyst looked at this exact host once" | exact host | no |
+| `known_fi.json` | "this organization is a legitimate institution" | subdomains | yes — basis, analyst, date |
+
+Two safety properties are deliberate. **A registry entry never suppresses infringement**: a registered host that claims a brand term is still counted as a threat and is flagged `** CONFLICT **` in the alert, because that combination means either the title match misfired or a legitimate domain has been compromised. And **a missing or corrupt registry file fails open** — it yields no institutions, so everything falls back to unreviewed and stays visible. Legitimacy requires positive membership, so a broken registry can never hide a finding.
+
+The rule itself lives in `fi_registry.py` and is imported by both the monitor and the report, so the verdict in an alert email and the scope of a manager metric cannot drift apart. The state is computed when a report is generated rather than stored on the case, so registering an institution retroactively cleans up historical numbers with no change to the database.
 
 ## Reports
 
@@ -96,6 +146,24 @@ In `--schedule` mode, Google auto-pauses on a rate block and each run is jittere
 python report.py --format html
 python report.py --summary
 ```
+
+Charts and KPIs cover **threats only** by default, since a chart captioned "fraudulent ads" that counted legitimate competitors would be lying. The three-state census is printed whatever the scope, so nothing is dropped silently:
+
+```
+Review states across 113 case(s): 23 threat, 12 known institution, 78 unreviewed
+Reporting scope: threats (23 case(s)).
+```
+
+Change what the figures cover with `--scope`:
+
+```
+python report.py --scope threats      # default — confirmed brand infringement
+python report.py --scope unreviewed   # the analyst work queue
+python report.py --scope legitimate   # what was excluded, and why
+python report.py --scope all          # every case, as before
+```
+
+`--infringing-only` still works as a deprecated alias for `--scope threats`. In `--format csv` / `all`, `kpis.csv` carries the census and the scope, and `review_queue.csv` lists the unreviewed cases ranked by how often they were seen — the shortest path to shrinking that bucket.
 
 Two helper scripts backfill history into a fresh database:
 
@@ -133,6 +201,7 @@ pytest
 * `domainmatch.py`: host extraction and domain matching for the allowlist and triage list.
 * `url_resolve.py`: works out the real landing page behind an ad link.
 * `findings_store.py`: SQLite store for grouping repeat sightings and tracking first and last seen.
+* `fi_registry.py`: the known-legitimate institution registry, and the one rule that assigns a finding its review state. Shared by the monitor and the report.
 * `report.py` and `report_data.py`: build the metrics report from the database.
 * `setup_profile.py`: one time browser profile setup for Google.
 * `backfill_findings.py` and `backfill_channels.py`: seed and label historical data.

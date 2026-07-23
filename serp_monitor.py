@@ -49,6 +49,7 @@ from pyvirtualdisplay import Display
 
 from domainmatch import host_of, host_in
 import brandmatch
+import fi_registry
 import findings_store
 import url_resolve
 
@@ -207,6 +208,13 @@ EVIDENCE_DIR = Path(os.getenv("EVIDENCE_DIR"))
 # SQLite campaign store: dedup + case identity + first/last-seen (v7, Lens #1
 # gap #4). Seed historical first_seen dates once with backfill_findings.py.
 FINDINGS_DB = os.getenv("FINDINGS_DB")
+
+# Known-legitimate financial institution registry (fi_registry.py). OPTIONAL,
+# unlike the paths above: unset simply means no institution has been vetted yet,
+# so every non-infringing finding stays "unreviewed" and visible. It is not
+# given a fallback path for the same reason the others are not — a placeholder
+# would silently read an empty registry and look like a working one.
+FI_REGISTRY_FILE = os.getenv("FI_REGISTRY_FILE")
 
 # Ads Transparency Center enrichment. Looks up each flagged destination
 # domain in adstransparency.google.com, which is searchable by domain and
@@ -2356,7 +2364,7 @@ async def run_checks(
 # Alert email
 # ---------------------------------------------------------------------------
 
-def _classification_lines(ad: dict) -> list[str]:
+def _classification_lines(ad: dict, fi_hosts: set[str] | None = None) -> list[str]:
     """
     The two independent questions an analyst needs answered first: how did this
     reach the page, and is it actually impersonating us?
@@ -2365,6 +2373,10 @@ def _classification_lines(ad: dict) -> list[str]:
     monitored queries are generic, so unrelated businesses legitimately
     bid and rank on them. The offence is claiming the brand while landing
     somewhere the brand does not own.
+
+    The verdict uses fi_registry.review_state — the same function report.py
+    scopes its metrics with — so what an analyst reads in this email and what a
+    manager reads in the report can never disagree about what counts as a threat.
     """
     channel = ad.get("detection_channel", CHANNEL_UNKNOWN)
     channel_text = {
@@ -2377,11 +2389,33 @@ def _classification_lines(ad: dict) -> list[str]:
         f"  Channel:           {channel_text}",
     ]
 
-    if ad.get("infringing"):
+    # Caller passes the registry so it is read once per alert, not once per
+    # finding; None means "read it yourself" for standalone/test callers.
+    if fi_hosts is None:
+        fi_hosts = fi_registry.load_hosts(FI_REGISTRY_FILE)
+    host  = host_of(ad.get("destination_url")) or host_of(ad.get("display_url"))
+    state = fi_registry.review_state(ad.get("infringing"), host, fi_hosts)
+
+    if state == fi_registry.THREAT:
         lines += [
             f"  Verdict:           ** BRAND INFRINGEMENT **",
             f"  Why:               the title claims \"{ad.get('matched_brand_term')}\" "
             f"but the destination is not a brand-owned domain",
+        ]
+        # Fail closed: registry membership never downgrades a live brand claim.
+        # It does mean something is wrong, so say which two things it could be.
+        if fi_registry.is_conflict(ad.get("infringing"), host, fi_hosts):
+            lines += [
+                "  ** CONFLICT **     this host is on the known-institution registry yet claims",
+                "                     our brand. Counted as a threat until reviewed. Either the",
+                "                     title match is a false positive, or a legitimate domain",
+                "                     has been compromised — both need a person.",
+            ]
+    elif state == fi_registry.LEGITIMATE:
+        lines += [
+            "  Verdict:           known institution — a registered, vetted financial",
+            "                     institution appearing for a generic term. Not an offence,",
+            "                     and excluded from the report metrics.",
         ]
     elif ad.get("claims_brand"):
         lines += [
@@ -2389,9 +2423,11 @@ def _classification_lines(ad: dict) -> list[str]:
         ]
     else:
         lines += [
-            "  Verdict:           no brand claim in the title. The monitored search terms",
-            "                     are generic, so this may simply be another unrelated",
-            "                     business appearing for the same query — review before acting.",
+            "  Verdict:           UNREVIEWED — no brand claim in the title, and this host is",
+            "                     not on the known-institution registry. The monitored search",
+            "                     terms are generic, so it may be an unrelated business — but",
+            "                     a fake page that simply left our name out of its title would",
+            "                     also land here. Review before clearing.",
         ]
 
     lines.append("")
@@ -2473,6 +2509,28 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
     # the whole product: an organic result that impersonates the brand (SEO
     # poisoning) is the same offence arriving by a different route, and needs a
     # different takedown.
+    # Review-state census for this run, using the same rule report.py scopes its
+    # metrics with. Read once here and threaded into every finding's block.
+    fi_hosts = fi_registry.load_hosts(FI_REGISTRY_FILE)
+    _states = [
+        fi_registry.review_state(
+            a.get("infringing"),
+            host_of(a.get("destination_url")) or host_of(a.get("display_url")),
+            fi_hosts,
+        )
+        for a in flagged_ads
+    ]
+    n_legitimate = sum(1 for s in _states if s == fi_registry.LEGITIMATE)
+    n_unreviewed = sum(1 for s in _states if s == fi_registry.UNREVIEWED)
+    n_conflicts  = sum(
+        1 for a in flagged_ads
+        if fi_registry.is_conflict(
+            a.get("infringing"),
+            host_of(a.get("destination_url")) or host_of(a.get("display_url")),
+            fi_hosts,
+        )
+    )
+
     n_sponsored  = sum(1 for a in flagged_ads
                        if a.get("detection_channel") == CHANNEL_SPONSORED)
     n_organic    = sum(1 for a in flagged_ads
@@ -2515,9 +2573,19 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
         "",
         "  By verdict (what it claims to be):",
         f"    BRAND INFRINGEMENT:    {n_infringing}  (claims a brand term, lands off-brand)",
-        f"    Other:                 {count - n_infringing}  (no brand claim — may be a legitimate",
-        "                              unrelated business appearing for the same query)",
+        f"    Known institution:     {n_legitimate}  (on the vetted registry — not an offence,",
+        "                              excluded from the report metrics)",
+        f"    UNREVIEWED:            {n_unreviewed}  (no brand claim and not on the registry —",
+        "                              may be an unrelated business, or a fake page that left",
+        "                              our name out of its title. Not cleared, just unjudged.)",
     ]
+    if n_conflicts:
+        lines += [
+            f"    ** {n_conflicts} CONFLICT(S) **      on the known-institution registry YET claiming",
+            "                              a brand term. Counted above as infringement until",
+            "                              reviewed — see the findings marked ** CONFLICT **.",
+        ]
+    lines += [""]
 
     if have_persistence:
         lines += [
@@ -2548,7 +2616,7 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
             "-" * 70,
             "",
         ]
-        lines += _classification_lines(ad)
+        lines += _classification_lines(ad, fi_hosts)
         lines += _persistence_lines(ad, device_label)
         lines += [
             "[ SEARCH CONTEXT ]",
@@ -3141,6 +3209,14 @@ Examples:
   # List every domain currently on the triage suppression list
   python serp_monitor.py --list-triage
 
+  # Record a real financial institution so it stops counting toward report
+  # metrics (it and its subdomains keep being collected and alerted on)
+  python serp_monitor.py --mark-legitimate examplebank.com \\
+      --institution "Example Bank, N.A." --basis "FDIC cert 12345" --analyst jdoe
+
+  # Show the known-legitimate institution registry, with why each was trusted
+  python serp_monitor.py --list-legitimate
+
 Notes:
   - --engine and --device are independent — combine them freely. The four
     corners are: both engines/both devices (default, recommended for
@@ -3162,6 +3238,16 @@ Notes:
     must respect the cooldown or it would only sustain the block.
   - --triage and --list-triage are one-shot utility actions: the script
     performs the requested action and exits without running ad detection.
+    So are --mark-legitimate and --list-legitimate.
+  - Every finding lands in exactly one of three review states, and report.py
+    scopes its metrics with the same rule the alert email prints:
+      threat      claims a brand term and lands off-brand (an offence)
+      legitimate  on the known-institution registry (--mark-legitimate)
+      unreviewed  neither — NOT an all-clear. A fake page that left the brand
+                  out of its title lands here, so it is reported as a work
+                  queue rather than folded in with the legitimate results.
+    A registry entry never suppresses infringement: a registered host that
+    claims a brand term is still counted as a threat and flagged CONFLICT.
         """
     )
     parser.add_argument(
@@ -3243,6 +3329,51 @@ Notes:
         ),
     )
     parser.add_argument(
+        "--mark-legitimate",
+        metavar="DOMAIN",
+        help=(
+            "Record a domain as a known-legitimate financial institution. The domain "
+            "and every subdomain of it stop counting toward report metrics, but keep "
+            "being collected — a real institution's domain can be compromised later, "
+            "and the alert still fires if it ever claims a brand term. Distinct from "
+            "--triage: this is a durable statement about an organization, carries the "
+            "reason it was trusted (--basis), and matches subdomains, whereas --triage "
+            "is a per-incident note on one exact host. One-shot action. "
+            "Example: python serp_monitor.py --mark-legitimate examplebank.com "
+            "--basis 'FDIC cert 12345' --analyst jdoe"
+        ),
+    )
+    parser.add_argument(
+        "--basis",
+        metavar="TEXT",
+        default="",
+        help=(
+            "Why the institution is trusted, stored with --mark-legitimate "
+            "(e.g. a charter or FDIC certificate number). Recorded so the decision "
+            "can be audited later rather than becoming an anonymous suppression."
+        ),
+    )
+    parser.add_argument(
+        "--institution",
+        metavar="NAME",
+        default="",
+        help="Institution name stored with --mark-legitimate (e.g. 'Example Bank, N.A.').",
+    )
+    parser.add_argument(
+        "--analyst",
+        metavar="NAME",
+        default="",
+        help="Who is making the call, stored with --mark-legitimate.",
+    )
+    parser.add_argument(
+        "--list-legitimate",
+        action="store_true",
+        help=(
+            "Print the known-legitimate institution registry and exit. "
+            "One-shot action — does not run ad detection."
+        ),
+    )
+    parser.add_argument(
         "--ignore-cooldown",
         action="store_true",
         help=(
@@ -3286,6 +3417,50 @@ Notes:
             print(f"\nHost '{stored}' added to triage list.")
             print("Future alerts for this exact host will be suppressed on Google and Bing.")
             print(f"Triage file: {TRIAGE_FILE}\n")
+
+    elif args.list_legitimate:
+        entries = fi_registry.load_entries(FI_REGISTRY_FILE)
+        if not FI_REGISTRY_FILE:
+            print("\nFI_REGISTRY_FILE is not set — no known-institution registry in use.")
+            print("Every non-infringing finding will be reported as UNREVIEWED.")
+            print("Set FI_REGISTRY_FILE in .env to start one (see env.example).\n")
+        elif entries:
+            print(f"\nKnown-legitimate institutions ({len(entries)}) — excluded from report "
+                  f"metrics, still collected and still alerted on if they claim a brand term:")
+            for e in entries:
+                name  = e.get("institution") or "(unnamed)"
+                basis = e.get("basis") or "no basis recorded"
+                who   = e.get("added_by") or "unknown"
+                print(f"  {e['domain']:38s} {name}")
+                print(f"  {'':38s} basis: {basis} — added by {who} on "
+                      f"{(e.get('added') or '?')[:10]}")
+            print(f"\nRegistry file: {FI_REGISTRY_FILE}\n")
+        else:
+            print(f"\nNo institutions registered yet in {FI_REGISTRY_FILE}.")
+            print("Add one with --mark-legitimate DOMAIN --basis '...' --analyst NAME\n")
+
+    elif args.mark_legitimate:
+        if not FI_REGISTRY_FILE:
+            print("\nCannot record: FI_REGISTRY_FILE is not set in .env.")
+            print("Set it to a writable path (see env.example) and retry.\n")
+        else:
+            entry = fi_registry.add_entry(
+                FI_REGISTRY_FILE, args.mark_legitimate,
+                institution=args.institution, basis=args.basis, added_by=args.analyst,
+            )
+            if entry is None:
+                print(f"\nDid not record '{args.mark_legitimate}' — either it is not a "
+                      f"parseable host or it is already on the registry.")
+                print("Check the current list with --list-legitimate\n")
+            else:
+                if not args.basis:
+                    print("\nNOTE: no --basis given. An entry without a recorded reason "
+                          "cannot be audited later.")
+                print(f"\n'{entry['domain']}' recorded as a known-legitimate institution.")
+                print("It and its subdomains no longer count toward report metrics.")
+                print("Collection continues, and an alert still fires if it ever claims")
+                print("a brand term — a registry entry never suppresses infringement.")
+                print(f"Registry file: {FI_REGISTRY_FILE}\n")
 
     elif args.schedule:
         run_scheduled(
