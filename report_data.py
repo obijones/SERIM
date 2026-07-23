@@ -63,6 +63,7 @@ def load_cases(
     exclude_hosts: set[str] | None = None,
     channel: str | None = None,
     infringing_only: bool = False,
+    fi_hosts: set[str] | None = None,
 ) -> list[dict]:
     """
     Loads normalized case rows from findings.db with optional filters.
@@ -73,8 +74,16 @@ def load_cases(
     matched exact-host — the store records every historical flag, including
     domains later triaged benign, which must not appear as "threats" in a
     manager report. Matching mirrors the monitor's exact-host triage semantics.
+
+    fi_hosts: the known-legitimate FI registry (fi_registry.load_hosts). Cases
+    are ANNOTATED with a review_state, never dropped — scoping is the caller's
+    decision, so a report can still show what it excluded. The state is computed
+    here at read time rather than read from a stored column, so adding an
+    institution to the registry retroactively cleans historical metrics; the
+    rule itself lives in fi_registry so the alert email applies the same one.
     """
     from domainmatch import host_in  # local import: keep this module import-light
+    import fi_registry
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -82,6 +91,7 @@ def load_cases(
     conn.close()
 
     exclude_hosts = exclude_hosts or set()
+    fi_hosts = fi_hosts or set()
     since_d, until_d = _d(since), _d(until)
     cases = []
     for r in rows:
@@ -108,10 +118,13 @@ def load_cases(
             continue
         if infringing_only and not infringing:
             continue
+        host = r["primary_host"]
         cases.append({
             "fingerprint":   r["fingerprint"],
             "engine":        eng,
-            "host":          r["primary_host"],
+            "host":          host,
+            "review_state":  fi_registry.review_state(infringing, host, fi_hosts),
+            "conflict":      fi_registry.is_conflict(infringing, host, fi_hosts),
             "first":         first,
             "last":          last,
             "times_seen":    r["times_seen"] or 0,
@@ -123,6 +136,39 @@ def load_cases(
             "active_window": (last - first).days,
         })
     return cases
+
+
+def by_state(cases: list[dict], state: str) -> list[dict]:
+    """The subset of cases in one review state (fi_registry.THREAT/…)."""
+    return [c for c in cases if c.get("review_state") == state]
+
+
+def review_summary(cases: list[dict]) -> dict:
+    """
+    The three-state census, plus registry conflicts.
+
+    Call this on the UNSCOPED population — it is the denominator that makes a
+    scoped threat count honest. `unreviewed` is reported as a work queue, not
+    rolled into either of the other two: it holds legitimate businesses nobody
+    has adjudicated yet AND any threat the title heuristic missed, so hiding it
+    would hide the recall gap. threats + legitimate + unreviewed == total.
+    """
+    import fi_registry
+
+    counts = {s: 0 for s in fi_registry.STATES}
+    for c in cases:
+        st = c.get("review_state", fi_registry.UNREVIEWED)
+        counts[st] = counts.get(st, 0) + 1
+    return {
+        "threats":     counts[fi_registry.THREAT],
+        "legitimate":  counts[fi_registry.LEGITIMATE],
+        "unreviewed":  counts[fi_registry.UNREVIEWED],
+        "total":       len(cases),
+        # Infringing AND on the registry — stays counted as a threat, but needs
+        # a human: either brandmatch mis-fired, or a real institution's domain
+        # has been compromised.
+        "conflicts":   sum(1 for c in cases if c.get("conflict")),
+    }
 
 
 def bucket_key(d: date, period: str) -> str:

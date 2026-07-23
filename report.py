@@ -38,9 +38,21 @@ from matplotlib.patches import Patch
 
 import report_data as rd
 
+import fi_registry
+
 DEFAULT_DB    = os.getenv("FINDINGS_DB", "/path/to/project/findings.db")
 DEFAULT_BRAND = os.getenv("BRAND_NAME", "Monitored Brand")
 TRIAGE_FILE   = os.getenv("TRIAGE_FILE", "/path/to/project/triaged_domains.json")
+FI_REGISTRY_FILE = os.getenv("FI_REGISTRY_FILE")
+
+# --scope reads as a plural noun ("threats"); the stored state is singular
+# ("threat"). Mapped explicitly rather than by string surgery, so a renamed
+# state fails loudly here instead of silently selecting an empty population.
+SCOPE_TO_STATE = {
+    "threats":    fi_registry.THREAT,
+    "legitimate": fi_registry.LEGITIMATE,
+    "unreviewed": fi_registry.UNREVIEWED,
+}
 
 
 def load_triaged_hosts() -> set[str]:
@@ -254,8 +266,36 @@ def _tile(value, label, accent=C_PRIMARY) -> str:
             f'<div class="tl">{label}</div></div>')
 
 
-def build_html(brand, k, imgs, top_rows, window_note, window="") -> str:
+def build_html(brand, k, imgs, top_rows, window_note, window="",
+               review=None, scope="threats") -> str:
     gen = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # The census row. Every case the monitor holds, split three ways, shown
+    # before any scoped figure — so "14 threats" is read against what it was
+    # separated from rather than as the whole of what was seen.
+    census = ""
+    if review:
+        census = (
+            '<div class="tiles">'
+            + _tile(review["threats"], "Confirmed threats", C_THREAT)
+            + _tile(review["legitimate"], "Known institutions (not counted)", C_SECOND)
+            + _tile(review["unreviewed"], "Awaiting review", C_MUTED)
+            + '</div>'
+            + f'<div class="note">Every one of the {review["total"]} campaigns seen falls in '
+              f'exactly one of these. <b>Confirmed threats</b> use our name and send people '
+              f'somewhere that is not us. <b>Known institutions</b> are real, licensed firms '
+              f'that appear because our search terms are generic — they are excluded from the '
+              f'figures below, and each one was vetted and recorded by name. '
+              f'<b>Awaiting review</b> is a work queue, not an all-clear: nobody has judged '
+              f'these yet, and a genuine fake that did not use our name in its title would sit '
+              f'here. It is shown rather than folded into either side so the gap stays visible.'
+            + (f' <b>{review["conflicts"]} case(s) conflict</b> — on the institution registry '
+               f'yet using our name. They are counted as threats until a person rules '
+               f'otherwise.' if review["conflicts"] else "")
+            + '</div>'
+            + f'<h2>Detail — {scope}</h2>'
+        )
+
     tiles = "".join([
         _tile(k["distinct"], "Unique scam campaigns"),
         _tile(k.get("infringing", 0), "Impersonating us by name", C_THREAT),
@@ -292,6 +332,7 @@ def build_html(brand, k, imgs, top_rows, window_note, window="") -> str:
 </style></head><body><div class="wrap">
  <h1>{brand} — Brand Ad Threat Report</h1>
  <div class="sub">Data window {window} &middot; generated {gen}</div>
+ {census}
  <div class="tiles">{tiles}</div>
 
  <h2>Fraudulent ads over time</h2>
@@ -358,9 +399,23 @@ def write_csv(path: Path, header: list[str], rows: list[list]):
         w.writerows(rows)
 
 
-def print_summary(brand, k, series, group_items, group_dim, window=""):
+def print_summary(brand, k, series, group_items, group_dim, window="",
+                  review=None, scope="threats"):
     print(f"\n{brand} — Brand Ad Threat Report")
     print(f"  window: {window}")
+    if review:
+        # The census comes first and always covers every case, so the scoped
+        # numbers below can never be mistaken for the whole picture.
+        print(f"  review states      : {review['threats']} threat, "
+              f"{review['legitimate']} known institution, "
+              f"{review['unreviewed']} unreviewed  (of {review['total']})")
+        if review["unreviewed"]:
+            print(f"                       {review['unreviewed']} case(s) await "
+                  f"adjudication — not counted as threats, not cleared either")
+        if review["conflicts"]:
+            print(f"                       {review['conflicts']} registry conflict(s) "
+                  f"— on the FI registry yet claiming a brand term")
+        print(f"  scope of figures   : {scope}")
     print(f"  distinct campaigns : {k['distinct']}   (raw sightings {k['raw']}, "
           f"{k['dedup_ratio']}x dedup)")
     # Channel counts can overlap (one host reached both ways), so they need not
@@ -403,8 +458,16 @@ def main():
     ap.add_argument("--device", choices=["desktop", "mobile"])
     ap.add_argument("--channel", choices=["sponsored_ad", "organic"],
                     help="only paid ads, or only poisoned organic results")
+    ap.add_argument("--scope", choices=["threats", "unreviewed", "legitimate", "all"],
+                    default="threats",
+                    help="which review state the charts and KPIs cover. "
+                         "threats (default) = claims a brand term and lands off-brand; "
+                         "legitimate = on the known-FI registry; "
+                         "unreviewed = neither, the analyst work queue; "
+                         "all = every case. The three-state census is printed "
+                         "whatever the scope, so nothing is silently dropped.")
     ap.add_argument("--infringing-only", action="store_true", dest="infringing_only",
-                    help="only results whose title claims the brand but land off-brand")
+                    help="deprecated alias for --scope threats")
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--out", default="/path/to/project/reports")
     ap.add_argument("--format", choices=["html", "png", "csv", "all"], default="all")
@@ -412,21 +475,47 @@ def main():
                     help="print KPIs to stdout and exit (no files)")
     ap.add_argument("--include-triaged", action="store_true",
                     help="include analyst-triaged benign domains (excluded by default)")
+    ap.add_argument("--fi-registry", dest="fi_registry", default=FI_REGISTRY_FILE,
+                    help="known-legitimate FI registry JSON (default: $FI_REGISTRY_FILE)")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
         print(f"No findings store at {args.db}. Run backfill_findings.py first.")
         return
 
+    # --infringing-only predates --scope and means the same thing. Kept working
+    # so existing runbooks and cron entries do not break.
+    scope = "threats" if args.infringing_only else args.scope
+
     exclude = set() if args.include_triaged else load_triaged_hosts()
-    cases = rd.load_cases(args.db, args.start_date, args.end_date, args.engine, args.device,
-                          exclude_hosts=exclude, channel=args.channel,
-                          infringing_only=args.infringing_only)
+    fi_hosts = fi_registry.load_hosts(args.fi_registry)
+    # Load the FULL population first: the three-state census is the denominator
+    # that makes a scoped threat count honest, so it must be computed before any
+    # scoping. load_cases annotates review_state; it never drops on it.
+    all_cases = rd.load_cases(args.db, args.start_date, args.end_date, args.engine,
+                              args.device, exclude_hosts=exclude, channel=args.channel,
+                              fi_hosts=fi_hosts)
+    review = rd.review_summary(all_cases)
+    cases  = all_cases if scope == "all" else rd.by_state(all_cases, SCOPE_TO_STATE[scope])
+
+    if exclude:
+        print(f"(excluding {len(exclude)} triaged benign host(s); --include-triaged to keep)")
+    print(
+        f"Review states across {review['total']} case(s): "
+        f"{review['threats']} threat, {review['legitimate']} known institution, "
+        f"{review['unreviewed']} unreviewed"
+        + (f"  [{len(fi_hosts)} institution(s) registered]" if fi_hosts else
+           "  [no FI registry loaded — every non-infringing case stays unreviewed]")
+    )
+    if review["conflicts"]:
+        print(f"  WARNING: {review['conflicts']} case(s) are on the FI registry AND claim a "
+              f"brand term. Counted as threats — review for a compromised domain or a "
+              f"brandmatch false positive.")
+    print(f"Reporting scope: {scope} ({len(cases)} case(s)).")
+
     if not cases:
         print("No cases match the given filters.")
         return
-    if exclude:
-        print(f"(excluding {len(exclude)} triaged benign host(s); --include-triaged to keep)")
 
     k       = rd.kpis(cases)
     series  = rd.trend(cases, args.period)
@@ -440,7 +529,8 @@ def main():
     win     = window_label(*effective_window(k, args.start_date, args.end_date))
 
     if args.summary:
-        print_summary(args.brand, k, series, group, args.group_by, win)
+        print_summary(args.brand, k, series, group, args.group_by, win,
+                      review=review, scope=scope)
         return
 
     out = Path(args.out)
@@ -494,7 +584,8 @@ def main():
         print(f"PNG charts written to {out}/")
 
     if args.format in ("html", "all"):
-        html = build_html(args.brand, k, imgs, top, window_note, win)
+        html = build_html(args.brand, k, imgs, top, window_note, win,
+                          review=review, scope=scope)
         (out / "report.html").write_text(html, encoding="utf-8")
         print(f"HTML dashboard: {out/'report.html'}")
 
@@ -510,8 +601,17 @@ def main():
                   [[r["host"], r["engine"], r["times_seen"], r["first"], r["last"], r["active_window"]]
                    for r in top])
         write_csv(out / "kpis.csv", ["metric", "value"],
-                  [[m, k[m]] for m in ("distinct", "raw", "dedup_ratio", "persistent",
-                                       "avg_window", "max_window", "recently_active")])
+                  [["scope", scope]]
+                  + [[f"review_{m}", review[m]] for m in
+                     ("threats", "legitimate", "unreviewed", "conflicts", "total")]
+                  + [[m, k[m]] for m in ("distinct", "raw", "dedup_ratio", "persistent",
+                                         "avg_window", "max_window", "recently_active")])
+        write_csv(out / "review_queue.csv",
+                  ["host", "engine", "times_seen", "first_seen", "last_seen"],
+                  [[c["host"], c["engine"], c["times_seen"],
+                    c["first"].isoformat(), c["last"].isoformat()]
+                   for c in sorted(rd.by_state(all_cases, fi_registry.UNREVIEWED),
+                                   key=lambda c: (-c["times_seen"], c["host"] or ""))])
         print(f"CSV aggregates written to {out}/")
 
 
