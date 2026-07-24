@@ -27,6 +27,8 @@ Everything the monitor can only get while the ad is live is therefore captured a
 
 When you do want advertiser identity after the fact, use the Ads Transparency Center, which is searchable by **landing domain** rather than by an ad you have to catch live, and which retains records for months after an ad stops serving. Every Google ad finding in the alert carries that domain link, whether or not the lookup found a creative. A domain with zero retained ads is a real answer rather than a failed lookup: it is what a suspended or withdrawn advertiser account looks like, and it is worth screenshotting.
 
+The archive is region scoped, so set `TRANSPARENCY_REGION` to the region your customers search from — the default is `US`. Bing has no equivalent public archive and an organic result never had an advertiser, so neither gets these links.
+
 ## Requirements
 
 * Python 3.10 or newer.
@@ -59,6 +61,8 @@ sudo apt install xvfb
    The database itself needs no setup. `FINDINGS_DB` just names a file path, and the store creates the file and its schema on the first run. If that path is left unset or points somewhere unwritable, the run still completes and alerts still send, but you will see `Campaign store update failed (continuing without dedup)` and that run gets no first seen or last seen grouping.
 
    `FI_REGISTRY_FILE` is optional — see [Legitimate institutions](#legitimate-institutions-and-the-three-review-states). Leaving it unset is safe: every non-infringing finding is then reported as unreviewed rather than quietly cleared.
+
+   The Ads Transparency Center settings are optional too, but check one of them. `TRANSPARENCY_REGION` (default `US`) is both the region the archive is searched in and the region the domain link in every alert points at — the archive is region scoped, so set this to where your customers see the ads or analysts open the wrong catalogue. `TRANSPARENCY_MAX_DOMAINS` (default 25) caps how many domains are looked up per run; anything past the cap is skipped for that run, not lost. `ENABLE_TRANSPARENCY_LOOKUP=0` turns the lookup off, and alerts keep the domain link, which needs no lookup.
 
 2. Open `serp_monitor.py` and set two things near the top:
 
@@ -151,16 +155,18 @@ The rule itself lives in `fi_registry.py` and is imported by both the monitor an
 `report.py` builds an executive pack from the database — slide-ready PNG charts, a single self-contained `report.html`, and CSV aggregates:
 
 ```
-python report.py                 # full pack to ./reports/ (monthly trend)
-python report.py --period week   # finer detail for operational review
-python report.py --summary       # census + KPIs to stdout, no files
+python report.py --out reports              # full pack, monthly trend
+python report.py --out reports --period week  # finer detail for operational review
+python report.py --summary                  # census + KPIs to stdout, no files
 ```
+
+`--db` falls back to `FINDINGS_DB` from `.env`, so it rarely needs passing. `--out` has no environment fallback and its built-in default is a placeholder path, so give it a directory (it is created if missing). `--summary` writes nothing and needs neither.
 
 The charts, all scoped to confirmed threats by default:
 
 * **Impersonation over time** — campaigns live per period. Monthly by default (`--period month`), which reads a 13–14 month history cleanly; partial edge months are marked, never dropped, so a short month cannot read as a decline.
 * **Paid ads vs SEO poisoning** — the same trend split by how each campaign reached customers, because the two need different takedowns.
-* **Engine and device** — a donut, two blues for Bing and two oranges for Google; cases with no device recorded are counted in the caption rather than dropped.
+* **Engine and device** — a donut, two blues for Bing and two oranges for Google; cases with no engine or device recorded are counted in the caption rather than dropped.
 * **Longest-lived threats** — the campaigns that stayed live longest, coloured by attack type (paid / SEO / both). The span is exposure observed while monitoring — a minimum, not a time-to-takedown, since Serim tracks detection, not remediation.
 * **Search-term and top-domain breakdowns.**
 
