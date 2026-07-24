@@ -1087,13 +1087,20 @@ def _send_attribution_alert(detail: str) -> None:
         detail,
         "",
         "[ REQUIRED ACTION ]",
-        "  1. Open a flagged Google SERP in Chrome and click the ad's ⋮ menu.",
+        "  1. Open a Google SERP carrying ANY sponsored ad and click its ⋮ menu.",
+        "     Do not go looking for the flagged ad — it is auction-served and will",
+        "     usually not render for you. The ⋮ menu and My Ad Center panel are",
+        "     engine chrome, identical on every ad, so any live ad re-derives the",
+        "     selectors just as well.",
         "  2. Inspect the menu trigger and the panel dialog for the current",
-        "     aria-label / jsname values.",
+        "     aria-label / jsname values. Expand 'About this advertiser' — the",
+        "     advertiser fields are lazy-loaded behind that accordion.",
         "  3. Update MENU_SELECTORS / PANEL_SELECTORS in fetch_advertiser_info().",
         "",
         "  Advertiser name / location / funder — and the foreign-funder IC3",
-        "  referral signal — remain unavailable until this is corrected.",
+        "  referral signal — remain unavailable until this is corrected. Capture",
+        "  happens at detection time or not at all, so every run that goes out",
+        "  broken is a permanent gap, not a deferred one.",
         "",
         "=" * 70,
     ]
@@ -1539,6 +1546,25 @@ def _normalize_domain(host: str | None) -> str | None:
     return host or None
 
 
+def atc_domain_url(host: str | None) -> str | None:
+    """
+    The Transparency Center's search-by-domain page for a landing host.
+
+    This is the one advertiser-attribution link that is always available, because
+    it is a pure function of the domain — no live ad, no captured panel and no
+    successful lookup required. It is what an analyst opens when the ad itself is
+    already gone, which is the normal case (see the guidance in the alert email).
+    Returns None for a host we could not resolve.
+    """
+    domain = _normalize_domain(host)
+    if not domain:
+        return None
+    return (
+        "https://adstransparency.google.com/"
+        f"?region={TRANSPARENCY_REGION}&domain={domain}"
+    )
+
+
 async def _lookup_one_domain(page: Page, domain: str) -> dict:
     """
     Query the Transparency Center for a single domain and extract the advertiser
@@ -1557,10 +1583,7 @@ async def _lookup_one_domain(page: Page, domain: str) -> dict:
         "atc_screenshot":         None,
         "atc_error":              None,
     }
-    url = (
-        "https://adstransparency.google.com/"
-        f"?region={TRANSPARENCY_REGION}&domain={domain}"
-    )
+    url = atc_domain_url(domain)
     try:
         await page.goto(url, timeout=45_000, wait_until="networkidle")
         # The ad grid renders client-side after networkidle; give it a beat.
@@ -2599,8 +2622,17 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
     lines += [
         "",
         "This alert was generated automatically by the brand protection",
-        "monitoring script. Each finding below contains all information",
-        "required to reproduce the ad and submit a takedown request.",
+        "monitoring script. Each finding below carries the evidence and the",
+        "identifiers a takedown submission needs.",
+        "",
+        "  NOTE ON RE-SEARCHING: running these queries by hand will usually NOT",
+        "  bring a sponsored finding back. Search ads are auction-served and",
+        "  audience-, geo-, device- and budget-targeted, and impersonators rotate",
+        "  and cloak them, so the ad is often gone or invisible to you minutes",
+        "  later. An empty re-search is NOT evidence the ad stopped running, and",
+        "  the ⋮ (three-dot) menu an analyst would use to report it is only there",
+        "  while the ad serves. The capture below was taken at detection time and",
+        "  is the record of record — submit from it.",
         "",
     ]
 
@@ -2709,15 +2741,27 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
             lines += [
                 "",
                 "[ ADVERTISER ATTRIBUTION — My Ad Center ]",
-                "  Panel not captured — check brand_monitor.log for [DEBUG] selector output.",
-                "  The debug output shows page text near 'advertiser' to identify the",
-                "  current panel selector. Manually click the ⋮ menu on the ad in Chrome",
-                "  → Inspect Element on the panel to find the updated aria-label or jsname.",
+                "  Not captured while the ad was serving, and it cannot be recovered",
+                "  by hand: the ⋮ menu exists only on a live impression, and this ad",
+                "  will usually not reappear for you (see NOTE ON RE-SEARCHING above).",
+                "  Do not spend time hunting for it. Use the Transparency Center link",
+                "  and the campaign / click IDs below — those outlive the ad.",
+                "  (If the panel stops capturing across a whole run, the script raises a",
+                "  separate operator alert; this line is not itself an action item.)",
             ]
 
         # Ads Transparency Center: durable advertiser identity + ad ID (v8).
         # Present even when the live panel could not be captured, and persists
         # after the ad stops serving.
+        #
+        # The domain link is emitted for EVERY Google paid finding, including the
+        # ones where the lookup found nothing or never ran. It costs nothing (it
+        # is a pure function of the landing host) and it is the only advertiser
+        # route left once the ad stops serving — which is the normal case by the
+        # time an analyst reads this. Bing has no equivalent public archive, and
+        # an organic result never had an advertiser, so both are skipped.
+        atc_link = atc_domain_url(ad.get("destination_host")) if engine_key == "google" else None
+
         if not is_organic and ad.get("atc_creative_id"):
             lines += [
                 "",
@@ -2730,17 +2774,39 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
                 "  ** This is the stable ad ID for the Google report — it persists even",
                 "     when the ad no longer appears in a live search. **",
             ]
+            if atc_link:
+                lines.append(f"  All ads for domain:  {atc_link}")
             if ad.get("atc_screenshot"):
                 lines.append(f"  ATC screenshot:      {ad.get('atc_screenshot')}")
-        elif not is_organic and engine_key == "google" and ad.get("atc_ad_count") is not None:
+        elif not is_organic and engine_key == "google":
             lines += [
                 "",
                 "[ ADS TRANSPARENCY CENTER — durable ad record ]",
-                f"  No retained creative for {ad.get('destination_host')} "
-                f"(ad count: {ad.get('atc_ad_count')}).",
-                "  Likely the advertiser account was suspended and its ads withdrawn,",
-                "  or the advertiser is unverified. Use the live evidence + campaign ID below.",
             ]
+            if ad.get("atc_ad_count") is not None:
+                lines += [
+                    f"  No retained creative for {ad.get('destination_host')} "
+                    f"(ad count: {ad.get('atc_ad_count')}).",
+                    "  Likely the advertiser account was suspended and its ads withdrawn,",
+                    "  or the advertiser is unverified.",
+                ]
+            else:
+                lines.append(
+                    "  Lookup did not run or returned nothing for this finding."
+                )
+            if atc_link:
+                lines += [
+                    f"  Search by domain:    {atc_link}",
+                    "  ** Open this instead of re-running the search query. The",
+                    "     Transparency Center is keyed by LANDING DOMAIN, not by an ad",
+                    "     you have to catch live, and it retains records for months",
+                    "     after an ad stops serving. Zero ads there is a real answer,",
+                    "     not a lookup failure — it is what a suspended or withdrawn",
+                    "     advertiser account looks like. Screenshot it either way. **",
+                ]
+            lines.append(
+                "  Otherwise submit from the captured evidence + campaign ID below."
+            )
 
         # Platform-specific attribution section, paid ads only (see is_organic).
         tracking_id    = ad.get("tracking_id")
@@ -2819,6 +2885,9 @@ def build_alert_email(flagged_ads: list[dict], run_timestamp: str) -> MIMEMultip
                 "  4. Note on cloaking: If landing page matches display URL, the",
                 "       advertiser uses a cloaking intermediary. Document the true",
                 "       destination from a manual click and include in submissions.",
+                "  5. File without re-observing the ad. The complaint asks for the",
+                "       ad's URLs, the search query and screenshots — all captured",
+                "       above — and does not require a creative ID.",
             ]
         elif engine_key == "bing":
             lines += [
