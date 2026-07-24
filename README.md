@@ -9,7 +9,7 @@ Serim watches Google and Bing search results and flags ads and pages that preten
 * Flags any result whose title claims your brand but whose destination is a domain you do not own.
 * Labels each result as a paid ad or an organic (ranked) page, because the two need different takedown routes.
 * Captures evidence for each finding: a full page screenshot, the ad screenshot, the page source, the tracking or click id, and, for Google ads, the advertiser details from the My Ad Center panel.
-* Looks up flagged domains in the Google Ads Transparency Center to recover a durable advertiser and ad id.
+* Looks up flagged domains in the Google Ads Transparency Center to recover a durable advertiser and ad id, and links the domain's Transparency Center page on every Google ad finding so there is always an advertiser route that outlives the ad.
 * Stores every finding in a small SQLite database, so repeat sightings are grouped into one case with a first seen and last seen date.
 * Emails an alert with all of the above plus step by step takedown guidance.
 
@@ -18,6 +18,14 @@ Serim watches Google and Bing search results and flags ads and pages that preten
 A result is treated as impersonation when the title claims your brand and the landing domain is not on your allowlist. The search terms are meant to be broad, so an unrelated business that happens to share a word with your brand is expected and is not counted as an offense. The matching logic lives in `brandmatch.py` and is covered by unit tests.
 
 Because the terms are broad, real financial institutions show up too. They are kept out of the report metrics through a registry of vetted institutions, and anything nobody has adjudicated is reported as its own number rather than counted as a threat — see [Legitimate institutions and the three review states](#legitimate-institutions-and-the-three-review-states).
+
+## Why you cannot re-find the ad by hand
+
+The natural first move on receiving an alert is to run the same query yourself and click the ad's three dot menu to see who paid for it. That will usually fail, and it is not a bug in the monitor. Search ads are auction served and targeted by audience, location, device and budget, and impersonators additionally rotate creatives and cloak their landing pages, so the impression the monitor caught is often not served to you minutes later. The three dot menu and the My Ad Center panel behind it exist only while an ad is actually rendering. An empty re-search is not evidence that the ad stopped running.
+
+Everything the monitor can only get while the ad is live is therefore captured at detection time: the screenshots, the page source, the resolved landing page, the campaign or click id, and the My Ad Center panel when it opens. Those artifacts are the record, and a takedown can be filed from them alone — the engine complaint forms ask for the ad's urls, the query and screenshots, not for a creative id.
+
+When you do want advertiser identity after the fact, use the Ads Transparency Center, which is searchable by **landing domain** rather than by an ad you have to catch live, and which retains records for months after an ad stops serving. Every Google ad finding in the alert carries that domain link, whether or not the lookup found a creative. A domain with zero retained ads is a real answer rather than a failed lookup: it is what a suspended or withdrawn advertiser account looks like, and it is worth screenshotting.
 
 ## Requirements
 
